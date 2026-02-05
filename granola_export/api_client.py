@@ -11,8 +11,8 @@ import gzip
 import json
 import logging
 import platform
+import time
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 from typing import Iterator, Optional
 import urllib.request
@@ -146,40 +146,86 @@ class GranolaAPIClient:
         endpoint: str,
         method: str = "POST",
         data: Optional[dict] = None,
+        max_retries: int = 3,
     ) -> dict:
-        """Make an API request."""
-        url = f"{self.config.base_url}{endpoint}"
+        """Make an API request with retry logic.
 
+        Args:
+            endpoint: API endpoint path.
+            method: HTTP method.
+            data: Request payload.
+            max_retries: Maximum retry attempts for transient failures.
+
+        Returns:
+            Parsed JSON response.
+
+        Raises:
+            urllib.error.HTTPError: For non-retryable HTTP errors.
+            urllib.error.URLError: After all retries exhausted.
+        """
+        url = f"{self.config.base_url}{endpoint}"
         body = json.dumps(data or {}).encode("utf-8")
 
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers=self._headers,
-            method=method,
-        )
+        last_exception = None
 
-        try:
-            with urllib.request.urlopen(req, timeout=30) as response:
-                raw_data = response.read()
+        for attempt in range(max_retries + 1):
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers=self._headers,
+                method=method,
+            )
 
-                # Check if response is gzip-compressed
-                if raw_data[:2] == b'\x1f\x8b':
-                    raw_data = gzip.decompress(raw_data)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    raw_data = response.read()
 
-                return json.loads(raw_data.decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            error_body = ""
-            if e.fp:
-                raw = e.read()
-                if raw[:2] == b'\x1f\x8b':
-                    raw = gzip.decompress(raw)
-                error_body = raw.decode("utf-8")
-            logger.error(f"API error {e.code}: {error_body}")
-            raise
-        except urllib.error.URLError as e:
-            logger.error(f"Network error: {e.reason}")
-            raise
+                    # Check if response is gzip-compressed
+                    if raw_data[:2] == b'\x1f\x8b':
+                        raw_data = gzip.decompress(raw_data)
+
+                    return json.loads(raw_data.decode("utf-8"))
+
+            except urllib.error.HTTPError as e:
+                # Retry on 5xx server errors
+                if e.code >= 500 and attempt < max_retries:
+                    delay = 2 ** attempt  # 1s, 2s, 4s
+                    logger.warning(
+                        f"Server error {e.code}, retrying in {delay}s "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(delay)
+                    last_exception = e
+                    continue
+
+                # Non-retryable HTTP error
+                error_body = ""
+                if e.fp:
+                    raw = e.read()
+                    if raw[:2] == b'\x1f\x8b':
+                        raw = gzip.decompress(raw)
+                    error_body = raw.decode("utf-8")
+                logger.error(f"API error {e.code}: {error_body}")
+                raise
+
+            except urllib.error.URLError as e:
+                # Retry on network errors (includes SSL timeouts)
+                if attempt < max_retries:
+                    delay = 2 ** attempt  # 1s, 2s, 4s
+                    logger.warning(
+                        f"Network error: {e.reason}, retrying in {delay}s "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(delay)
+                    last_exception = e
+                    continue
+
+                logger.error(f"Network error after {max_retries} retries: {e.reason}")
+                raise
+
+        # Should not reach here, but just in case
+        if last_exception:
+            raise last_exception
 
     # -------------------------------------------------------------------------
     # Documents
